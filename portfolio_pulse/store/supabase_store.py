@@ -1,7 +1,7 @@
 """Supabase (hosted Postgres) backend — the production store.
 
 Implements the exact same `Store` interface as SQLiteStore, over PostgREST via
-supabase-py, so the poller (GitHub Actions) and the dashboard (Streamlit Cloud)
+supabase-py, so the GitHub Actions poller and the Streamlit Cloud dashboard
 share one database. Run migrations/supabase_schema.sql once before first use.
 
 Only credential-bearing hosts instantiate this; local development stays on SQLite.
@@ -9,8 +9,7 @@ Only credential-bearing hosts instantiate this; local development stays on SQLit
 
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Any, Iterable, Optional
+from typing import Any, Optional
 
 from portfolio_pulse import config
 from portfolio_pulse.store.db import Alert, WatchItem, _iso
@@ -25,7 +24,7 @@ class SupabaseStore:
     def _t(self, name: str):
         return self.client.table(name)
 
-    # -- watchlist / holdings -------------------------------------------------
+    # -- watchlist / positions -------------------------------------------------
     def add_watch(self, symbol: str, name: str = "", kind: str = "watch") -> bool:
         symbol = symbol.strip().upper()
         row = {"symbol": symbol, "kind": kind, "added_at": _iso()}
@@ -35,13 +34,12 @@ class SupabaseStore:
         return True
 
     def remove_watch(self, symbol: str) -> bool:
+        """Fully untrack a symbol — clears any open position too. Use
+        `close_position` instead if you just sold but want to keep the symbol."""
         symbol = symbol.strip().upper()
+        self._t("holdings_snapshot").delete().eq("symbol", symbol).execute()
         res = self._t("watchlist").delete().eq("symbol", symbol).execute()
         return bool(res.data)
-
-    def clear_watch(self) -> int:
-        res = self._t("watchlist").delete().eq("kind", "watch").execute()
-        return len(res.data or [])
 
     def list_watch(self, kind: Optional[str] = None) -> list[WatchItem]:
         q = self._t("watchlist").select("*").order("symbol")
@@ -55,50 +53,37 @@ class SupabaseStore:
         rows = self._t("watchlist").select("symbol").execute().data or []
         return [r["symbol"] for r in rows]
 
-    def sync_holdings(self, rows: Iterable[dict[str, Any]]) -> int:
-        rows = list(rows)
-        # Existing names are precious (they drive NSE filing matching) — never
-        # overwrite a real name with an empty one. Mirrors the SQLite semantics.
-        current = {w.symbol: w.name for w in self.list_watch()}
-        # Replace snapshot (PostgREST delete needs a filter that matches all rows).
-        self._t("holdings_snapshot").delete().neq("symbol", "\x00").execute()
-        n = 0
-        for r in rows:
-            sym = str(r["symbol"]).strip().upper()
-            self._t("holdings_snapshot").upsert({
-                "symbol": sym, "qty": float(r.get("qty", 0)),
-                "avg_price": float(r.get("avg_price", 0)),
-                "last_price": float(r.get("last_price", 0)), "synced_at": _iso(),
-            }, on_conflict="symbol").execute()
-            name = str(r.get("name", "")) or current.get(sym, "")
-            self._t("watchlist").upsert({
-                "symbol": sym, "name": name, "kind": "holding",
-                "added_at": _iso(),
-            }, on_conflict="symbol").execute()
-            n += 1
-        return n
+    def upsert_position(self, symbol: str, qty: float, avg_price: float,
+                        name: str = "") -> None:
+        symbol = symbol.strip().upper()
+        existing = self._t("holdings_snapshot").select("last_price").eq(
+            "symbol", symbol).limit(1).execute().data
+        last_price = existing[0]["last_price"] if existing else avg_price
+        self._t("holdings_snapshot").upsert({
+            "symbol": symbol, "qty": float(qty), "avg_price": float(avg_price),
+            "last_price": float(last_price), "synced_at": _iso(),
+        }, on_conflict="symbol").execute()
+        current_name = {w.symbol: w.name for w in self.list_watch()}.get(symbol, "")
+        self._t("watchlist").upsert({
+            "symbol": symbol, "name": name or current_name, "kind": "holding",
+            "added_at": _iso(),
+        }, on_conflict="symbol").execute()
+
+    def close_position(self, symbol: str) -> bool:
+        symbol = symbol.strip().upper()
+        res = self._t("holdings_snapshot").delete().eq("symbol", symbol).execute()
+        had_position = bool(res.data)
+        if had_position:
+            self._t("watchlist").update({"kind": "watch"}).eq(
+                "symbol", symbol).execute()
+        return had_position
+
+    def update_last_price(self, symbol: str, last_price: float) -> None:
+        self._t("holdings_snapshot").update({"last_price": float(last_price)}).eq(
+            "symbol", symbol.strip().upper()).execute()
 
     def get_holdings(self) -> list[dict[str, Any]]:
         return self._t("holdings_snapshot").select("*").order("symbol").execute().data or []
-
-    # -- dedup ----------------------------------------------------------------
-    def mark_seen(self, guid: str, symbol: str, source_type: str,
-                  title: str, url: str, published_at: Optional[str]) -> bool:
-        try:
-            self._t("seen_items").insert({
-                "guid": guid, "symbol": symbol, "source_type": source_type,
-                "title": title, "url": url, "published_at": published_at,
-                "ingested_at": _iso(),
-            }).execute()
-            return True
-        except Exception as exc:  # unique-violation => already seen
-            if "23505" in str(exc) or "duplicate" in str(exc).lower():
-                return False
-            raise
-
-    def is_seen(self, guid: str) -> bool:
-        res = self._t("seen_items").select("guid").eq("guid", guid).limit(1).execute()
-        return bool(res.data)
 
     # -- alerts ---------------------------------------------------------------
     def record_alert(self, alert: Alert) -> int:
@@ -125,32 +110,6 @@ class SupabaseStore:
                   r["created_at"], bool(r["delivered"]))
             for r in rows
         ]
-
-    # -- dma state ------------------------------------------------------------
-    def get_dma_state(self, symbol: str) -> Optional[dict[str, Any]]:
-        res = self._t("dma_state").select("*").eq(
-            "symbol", symbol.strip().upper()).limit(1).execute()
-        return res.data[0] if res.data else None
-
-    def upsert_dma_state(self, symbol: str, sma50: float, sma200: float,
-                         relation: str, gap_pct: float,
-                         projected_days: Optional[float]) -> None:
-        self._t("dma_state").upsert({
-            "symbol": symbol.strip().upper(), "sma50": sma50, "sma200": sma200,
-            "relation": relation, "gap_pct": gap_pct,
-            "projected_days": projected_days, "updated_at": _iso(),
-        }, on_conflict="symbol").execute()
-
-    # -- kite token -----------------------------------------------------------
-    def save_token(self, access_token: str, public_token: str = "") -> None:
-        self._t("auth_token").upsert({
-            "id": 1, "access_token": access_token, "public_token": public_token,
-            "issued_at": _iso(),
-        }, on_conflict="id").execute()
-
-    def load_token(self) -> Optional[dict[str, Any]]:
-        res = self._t("auth_token").select("*").eq("id", 1).limit(1).execute()
-        return res.data[0] if res.data else None
 
     # -- meta -----------------------------------------------------------------
     def get_meta(self, key: str) -> Optional[str]:

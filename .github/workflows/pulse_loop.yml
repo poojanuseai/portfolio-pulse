@@ -3,7 +3,7 @@ name: pulse-loop
 # Self-perpetuating ~10-minute poller — guaranteed cadence with no external
 # services or tokens. One run polls every ~10 min for up to ~5.5 h, then
 # dispatches a fresh copy of itself (workflow_dispatch via GITHUB_TOKEN is
-# exempt from GitHub's no-recursive-trigger rule). Outside 08:00–24:00 IST it
+# exempt from GitHub's no-recursive-trigger rule). Outside ~05:00–24:00 ET it
 # exits quietly; the hourly cron below restarts the chain each morning and
 # after any breakage. setup-check also starts it directly on a fresh install.
 #
@@ -13,7 +13,7 @@ name: pulse-loop
 on:
   workflow_dispatch:
   schedule:
-    - cron: "7 2-18 * * *"   # hourly restart net during the IST window
+    - cron: "7 9-23 * * *"   # hourly restart net during the UTC window (~05:00-23:00 ET)
 
 permissions:
   actions: write
@@ -36,14 +36,10 @@ jobs:
       - name: Poll every ~10 min, then hand over to a fresh run
         env:
           PP_STORE_BACKEND: supabase
-          PP_DASHBOARD_URL: ${{ vars.PP_DASHBOARD_URL }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          KITE_API_KEY: ${{ secrets.KITE_API_KEY }}
-          KITE_API_SECRET: ${{ secrets.KITE_API_SECRET }}
           GH_TOKEN: ${{ github.token }}
         run: |
           if [ "${{ vars.PP_TURBO }}" = "off" ]; then
@@ -53,10 +49,10 @@ jobs:
           START=$(date +%s)
           HANDOVER=0
           while true; do
-            H=$(( 10#$(TZ=Asia/Kolkata date +%H) ))
-            if [ "$H" -lt 8 ]; then
-              echo "Outside 08:00-24:00 IST (hour $H) — sleeping until morning restart."
-              break   # no handover: the hourly cron revives the chain at ~07:37 IST
+            H=$(( 10#$(TZ=America/New_York date +%H) ))
+            if [ "$H" -lt 5 ]; then
+              echo "Outside ~05:00-24:00 ET (hour $H) — sleeping until morning restart."
+              break   # no handover: the hourly cron revives the chain each morning
             fi
             python -m portfolio_pulse.jobs.heartbeat || true
             ELAPSED=$(( $(date +%s) - START ))

@@ -3,9 +3,9 @@
 Two responsibilities:
   * Push: send formatted alerts. Uses the plain Bot HTTP API via requests so it
     works from a stateless GitHub Actions run (no long-lived process needed).
-  * Commands: /add /remove /list /holdings, drained with getUpdates each poll
-    (offset persisted in the store's meta table). Only messages from the
-    configured chat_id are honoured — everyone else is ignored.
+  * Commands: /add /sell /watch /remove /positions /list, drained with
+    getUpdates each poll (offset persisted in the store's meta table). Only
+    messages from the configured chat_id are honoured — everyone else is ignored.
 
 Message formatting is separated from I/O (format_alert, parse_command,
 handle_update are pure) so the logic is unit-tested without network or a token.
@@ -14,7 +14,6 @@ handle_update are pure) so the logic is unit-tested without network or a token.
 from __future__ import annotations
 
 import html
-from dataclasses import dataclass
 from typing import Optional
 
 import requests
@@ -27,10 +26,9 @@ _OFFSET_KEY = "telegram_update_offset"
 
 _QC_BADGE = {
     "CONFIRMED": "✅ verified",
-    "EXTRACT": "📄 quoted from filing",
-    "PARTIAL": "⚠️ headline only",
+    "PARTIAL": "⚠️ partial",
     "INSUFFICIENT": "⚠️ headline only",
-    "SUSPECT": "⚠️ price unverified",
+    "SUSPECT": "⚠️ unverified",
     "SINGLE-SOURCE": "ℹ️ single source",
 }
 
@@ -58,7 +56,8 @@ def format_alert(alert: Alert) -> str:
 
 
 def parse_command(text: str) -> tuple[str, str]:
-    """Split '/add INFY' -> ('add', 'INFY'). Strips a bot @mention suffix."""
+    """Split '/add AAPL 10 185.50' -> ('add', 'AAPL 10 185.50'). Strips a bot
+    @mention suffix."""
     text = (text or "").strip()
     if not text.startswith("/"):
         return "", ""
@@ -70,216 +69,56 @@ def parse_command(text: str) -> tuple[str, str]:
 
 _HELP = (
     "Portfolio Pulse commands:\n"
-    "/add NAME or SYMBOL — add a stock (e.g. /add tata motors, /add INFY)\n"
-    "/remove SYMBOL — remove a watchlist stock\n"
-    "/newlist — start a fresh, empty watchlist (holdings untouched)\n"
-    "/list — show watchlist + holdings\n"
-    "/holdings — show current holdings snapshot\n"
-    "/connect [zerodha|upstox|dhan|groww|fyers] — connect a broker (MCP)\n"
-    "/sync — refresh holdings from every connected broker"
+    "/add SYMBOL QTY PRICE — log/update a position (e.g. /add AAPL 10 185.50)\n"
+    "/sell SYMBOL — close a position, keep the stock on your watchlist\n"
+    "/watch SYMBOL — track a stock with no position (screener candidates)\n"
+    "/remove SYMBOL — stop tracking a stock entirely (position + watchlist)\n"
+    "/positions — your open positions with live P&L\n"
+    "/list — positions + watchlist, symbols only"
 )
 
 
-def _resolve_stock(store, query: str) -> tuple[Optional[str], str, bool]:
-    """Resolve free text ('tata motors', 'INFY') to (SYMBOL, name, verified).
-
-    Order: exact symbol in the local instruments cache -> live MCP instrument
-    search (works while a broker session is up) -> yfinance lookup -> bare-
-    ticker fallback for single-word queries. `verified` is False only on that
-    last fallback — the symbol could not be confirmed to exist (dead tickers
-    like TATAMOTORS post-demerger land here), so callers should warn.
-    Returns (None, '', False) when nothing safe was found.
-    """
-    q = query.strip()
-    up = q.upper()
-
-    from portfolio_pulse.broker.holdings import _load_instruments_cache, merge_names
-
-    cache = _load_instruments_cache(max_age_days=365) or {}
-    if up in cache:
-        return up, cache[up], True
-
+def _resolve_stock(query: str) -> tuple[Optional[str], str, bool]:
+    """Resolve a bare US ticker (e.g. 'AAPL', 'BRK-B') to (SYMBOL, name, verified)
+    via yfinance. There's no broker/company-name search here — type the exact
+    ticker. `verified=False` means the symbol couldn't be confirmed to exist
+    (network hiccup, or a genuine typo/delisted ticker) — callers should warn
+    but still accept it so a transient lookup failure doesn't block logging a
+    position. Returns (None, '', False) only when the input isn't ticker-shaped
+    at all (empty, contains spaces, or absurdly long)."""
+    up = query.strip().upper()
+    if not up or " " in up or not (1 <= len(up) <= 10):
+        return None, "", False
     try:
-        from portfolio_pulse.broker.kite_mcp import KiteMCPClient
+        import yfinance as yf
 
-        mcp = KiteMCPClient(store)
-        if mcp.session_id:
-            data = mcp._json(mcp.call_tool("search_instruments", {"query": q}))
-            rows = data if isinstance(data, list) else next(
-                (data[k] for k in ("instruments", "data", "items", "result")
-                 if isinstance(data, dict) and isinstance(data.get(k), list)), [])
-            best = None
-            for row in rows:
-                if not isinstance(row, dict):
-                    continue
-                if row.get("exchange", "NSE").upper() not in ("NSE", ""):
-                    continue
-                ts = (row.get("tradingsymbol") or "").strip().upper()
-                if not ts:
-                    continue
-                if ts == up:            # exact ticker typed
-                    best = row
-                    break
-                if best is None:        # else first NSE hit for a name query
-                    best = row
-            if best:
-                sym = best["tradingsymbol"].strip().upper()
-                name = (best.get("name") or "").strip()
-                if name:
-                    merge_names({sym: name})  # so NSE filings match immediately
-                return sym, name, True
+        info = yf.Ticker(up).info or {}
+        name = (info.get("longName") or info.get("shortName") or "").strip()
+        if name:
+            return up, name, True
     except Exception:
-        pass  # search unavailable (no session / network) -> fall through
-
-    if " " not in q and 2 <= len(up) <= 20:
-        # Bare ticker with no broker session: resolve the company name from
-        # yfinance (public). The name matters — NSE filing matching keys on it,
-        # and a nameless stock gets no filing/news alerts (fails closed).
-        try:
-            import yfinance as yf
-
-            info = yf.Ticker(f"{up}.NS").info or {}
-            name = (info.get("longName") or info.get("shortName") or "").strip()
-            if name:
-                merge_names({up: name})
-                return up, name, True
-        except Exception:
-            pass
-        # Accepted but UNVERIFIED — could be a dead/renamed ticker.
-        return up, "", False
-    return None, "", False
+        pass
+    return up, "", False
 
 
-def _phone_oauth_link(store, broker: str) -> Optional[str]:
-    """Mint a tap-on-phone OAuth login link, using the hosted dashboard as the
-    redirect target. Returns None when no dashboard URL is configured (the
-    local-script fallback applies) or when anything in the flow fails."""
-    from portfolio_pulse import config
-
-    if not config.DASHBOARD_URL:
-        return None
-    try:
-        import base64
-        import hashlib
-        import json as _json
-        import secrets
-        import time
-        import urllib.parse
-
-        import requests
-
-        from portfolio_pulse.broker.mcp_oauth import BROKER_MCP_URLS, discover
-        from portfolio_pulse.broker.upstox_mcp import MCP_ENDPOINT as _UPSTOX_URL
-
-        mcp_url = _UPSTOX_URL if broker == "upstox" else BROKER_MCP_URLS[broker]
-        ep = discover(mcp_url)
-        if not ep.get("register"):
-            return None
-        redirect = config.DASHBOARD_URL + "/"
-        reg = requests.post(ep["register"], json={
-            "client_name": "Portfolio Pulse",
-            "redirect_uris": [redirect],
-            "grant_types": ["authorization_code", "refresh_token"],
-            "response_types": ["code"],
-            "token_endpoint_auth_method": "none",
-        }, timeout=20)
-        if reg.status_code >= 400:
-            return None
-        client_id = reg.json()["client_id"]
-        verifier = base64.urlsafe_b64encode(
-            secrets.token_bytes(48)).rstrip(b"=").decode()
-        challenge = base64.urlsafe_b64encode(
-            hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
-        store.set_meta(f"{broker}_oauth_pending", _json.dumps({
-            "client_id": client_id, "verifier": verifier,
-            "token_endpoint": ep["token"], "redirect_uri": redirect,
-            "ts": time.time(),
-        }))
-        return ep["authorize"] + "?" + urllib.parse.urlencode({
-            "response_type": "code", "client_id": client_id,
-            "redirect_uri": redirect,
-            "state": f"{broker}:{secrets.token_urlsafe(8)}",
-            "code_challenge": challenge, "code_challenge_method": "S256",
-        })
-    except Exception:
-        return None
-
-
-def _broker_connect_reply(store, which: str = "zerodha") -> str:
-    """Connect/reconnect instructions per broker. Used by /connect [broker]."""
-    which = (which or "zerodha").strip().lower()
-
-    if which in ("upstox", "u", "dhan", "groww"):
-        broker = "upstox" if which == "u" else which
-        if broker == "upstox":
-            from portfolio_pulse.broker.upstox_mcp import UpstoxMCPClient, load_oauth
-
-            if (load_oauth(store).get("access_token")
-                    and UpstoxMCPClient(store).connected()):
-                return "Upstox already connected. Send /sync to refresh holdings."
-        link = _phone_oauth_link(store, broker)
-        if link:
-            return (
-                f"🔐 <b>Connect {broker.title()}</b> (read-only, official MCP):\n"
-                f'<a href="{link}">Login with {broker.title()}</a>\n'
-                "⏱ Tap right away and log in — you'll land on your dashboard "
-                "with a confirmation, and a ✅ arrives here within ~10 minutes."
-            )
-        return (
-            f"🔐 <b>Connect {broker.title()}</b> (read-only, official MCP):\n"
-            "Run this once on your computer:\n"
-            f"<code>python -m portfolio_pulse.jobs."
-            f"{'upstox_connect' if broker == 'upstox' else 'broker_connect ' + broker}"
-            "</code>\nIt opens the broker login, then syncs automatically. "
-            "(Tip: deploy the dashboard to get tap-on-phone connects instead.)"
-        )
-
-    if which == "fyers":
-        return (
-            "🔐 <b>Connect Fyers</b> (read-only, official Fyers MCP):\n"
-            "Run this once on your computer:\n"
-            "<code>python -m portfolio_pulse.jobs.broker_connect fyers</code>\n"
-            "It opens the Fyers login, then syncs your holdings automatically."
-        )
-
-    from portfolio_pulse.broker.kite_mcp import KiteMCPClient, MCPError
-
-    mcp = KiteMCPClient(store)
-    try:
-        mcp.ensure_session()
-        if mcp.logged_in():
-            return ("Zerodha already connected. Send /sync to refresh holdings.\n"
-                    "Also have Upstox? Send /connect upstox")
-        url = mcp.login_url()
-    except MCPError as exc:
-        return f"Could not reach the Kite MCP server: {exc}"
-    return (
-        "🔐 <b>Connect Zerodha</b> (read-only, via official Kite MCP):\n"
-        f'<a href="{url}">Login with Kite</a>\n'
-        "⏱ The link expires in a few minutes — tap it right away, "
-        "then send /sync to pull your holdings.\n"
-        "<i>Other brokers: /connect upstox · dhan · groww · fyers</i>"
-    )
-
-
-def _broker_sync_reply(store) -> str:
-    """Refresh holdings from every live broker session. Used by /sync."""
-    from portfolio_pulse.broker import get_live_brokers, holdings
-
-    brokers = get_live_brokers(store)
-    if not brokers:
-        return ("No live broker session — reconnect first:\n"
-                + _broker_connect_reply(store))
-    parts = []
-    for name, client in brokers:
-        try:
-            n = holdings.sync(store, client, broker=name)
-            parts.append(f"{name}: {n}")
-        except Exception as exc:  # broker hiccups must never crash the bot
-            parts.append(f"{name}: failed ({str(exc)[:80]})")
-    syms = [r["symbol"] for r in store.get_holdings()]
-    return (f"✅ Synced — {', '.join(parts)}\n"
-            f"Combined portfolio ({len(syms)}): {', '.join(syms) or '—'}")
+def _positions_reply(store) -> str:
+    rows = store.get_holdings()
+    if not rows:
+        return "No open positions yet. Log one with /add SYMBOL QTY PRICE"
+    lines = []
+    total_invested = total_value = 0.0
+    for r in sorted(rows, key=lambda x: x["symbol"]):
+        qty, avg, last = r["qty"], r["avg_price"], r["last_price"]
+        invested, value = qty * avg, qty * last
+        pnl_pct = (last - avg) / avg * 100 if avg else 0.0
+        total_invested += invested
+        total_value += value
+        lines.append(f"{r['symbol']}: {qty:g} @ ${avg:,.2f} → ${last:,.2f} "
+                     f"({pnl_pct:+.1f}%)")
+    total_pnl = total_value - total_invested
+    total_pct = (total_pnl / total_invested * 100) if total_invested else 0.0
+    lines.append(f"\nTotal: ${total_value:,.2f} ({total_pnl:+,.2f}, {total_pct:+.1f}%)")
+    return "\n".join(lines)
 
 
 def handle_update(update: dict, store) -> Optional[str]:
@@ -297,68 +136,66 @@ def handle_update(update: dict, store) -> Optional[str]:
 
     if cmd in ("start", "help"):
         return _HELP
+
     if cmd == "add":
-        if not arg:
-            return "Usage: /add NAME or SYMBOL (e.g. /add tata motors)"
-        sym, name, verified = _resolve_stock(store, arg)
+        parts = arg.split()
+        if len(parts) != 3:
+            return "Usage: /add SYMBOL QTY PRICE (e.g. /add AAPL 10 185.50)"
+        sym_raw, qty_raw, price_raw = parts
+        try:
+            qty, price = float(qty_raw), float(price_raw)
+        except ValueError:
+            return "Qty and price must be numbers. Usage: /add SYMBOL QTY PRICE"
+        if qty <= 0 or price <= 0:
+            return "Qty and price must be positive."
+        sym, name, verified = _resolve_stock(sym_raw)
         if not sym:
-            return (f"Couldn't identify '{arg}'. Try the exact NSE symbol "
-                    "(e.g. /add RELIANCE), or /connect the broker first so I "
-                    "can search by company name.")
-        existing = {w.symbol: w.kind for w in store.list_watch()}
-        if existing.get(sym) == "holding":
-            return f"{sym} is already tracked as a holding — no need to watchlist it."
+            return f"'{sym_raw}' doesn't look like a ticker. Usage: /add AAPL 10 185.50"
+        store.upsert_position(sym, qty, price, name)
+        label = f"{sym} ({name})" if name else sym
+        reply = f"✅ Logged {qty:g} sh of {label} @ ${price:,.2f}."
+        if not verified:
+            reply += ("\n⚠️ Couldn't verify this ticker exists right now — "
+                      "double-check it; /remove it if it was a typo.")
+        return reply
+
+    if cmd == "watch":
+        if not arg:
+            return "Usage: /watch SYMBOL"
+        sym, name, verified = _resolve_stock(arg.split()[0])
+        if not sym:
+            return f"'{arg}' doesn't look like a ticker."
         store.add_watch(sym, name, kind="watch")
         label = f"{sym} ({name})" if name else sym
-        reply = f"Added {label} to your watchlist."
+        reply = f"👁 Watching {label} (no position)."
         if not verified:
-            reply += ("\n⚠️ I couldn't verify this symbol exists on NSE — if it's "
-                      "delisted or renamed (e.g. TATAMOTORS became TMPV/TMCV after "
-                      "the demerger), it will never produce data. Double-check the "
-                      "ticker; /remove it if it was a typo.")
+            reply += "\n⚠️ Couldn't verify this ticker exists right now."
         return reply
+
+    if cmd == "sell":
+        if not arg:
+            return "Usage: /sell SYMBOL"
+        sym = arg.split()[0].upper()
+        ok = store.close_position(sym)
+        return (f"Closed {sym} — kept on your watchlist for alerts/history."
+                if ok else f"{sym} had no open position.")
+
     if cmd == "remove":
         if not arg:
             return "Usage: /remove SYMBOL"
-        ok = store.remove_watch(arg.split()[0])
         sym = arg.split()[0].upper()
-        return f"Removed {sym}." if ok else f"{sym} was not in your watchlist."
-    if cmd in ("newlist", "clearwatch"):
-        n = store.clear_watch()
-        return (f"🧹 Fresh watchlist started ({n} stock(s) removed). "
-                "Add stocks with /add NAME — your holdings are unaffected.")
-    if cmd == "list":
-        watch = [w.symbol for w in store.list_watch("watch")]
-        hold = [w.symbol for w in store.list_watch("holding")]
-        return (f"Holdings ({len(hold)}): {', '.join(hold) or '—'}\n"
-                f"Watchlist ({len(watch)}): {', '.join(watch) or '—'}")
-    if cmd == "holdings":
-        import json as _json
+        ok = store.remove_watch(sym)
+        return f"Removed {sym} entirely." if ok else f"{sym} was not tracked."
 
-        sections = []
-        for broker, label in (("zerodha", "Zerodha"), ("upstox", "Upstox")):
-            raw = store.get_meta(f"holdings:{broker}")
-            if not raw:
-                continue
-            try:
-                recs = _json.loads(raw)
-            except _json.JSONDecodeError:
-                continue
-            if recs:
-                lines = [f"{r['symbol']}: {r['qty']:g} @ {r['avg_price']:g}"
-                         for r in sorted(recs, key=lambda x: x.get("symbol", ""))]
-                sections.append(f"<b>{label}</b> ({len(recs)})\n" + "\n".join(lines))
-        if not sections:
-            rows = store.get_holdings()
-            if not rows:
-                return "No holdings synced yet."
-            return "\n".join(f"{r['symbol']}: {r['qty']:g} @ {r['avg_price']:g}"
-                             for r in rows)
-        return "\n\n".join(sections)
-    if cmd == "connect":
-        return _broker_connect_reply(store, arg)
-    if cmd == "sync":
-        return _broker_sync_reply(store)
+    if cmd == "positions":
+        return _positions_reply(store)
+
+    if cmd == "list":
+        hold = [w.symbol for w in store.list_watch("holding")]
+        watch = [w.symbol for w in store.list_watch("watch")]
+        return (f"Positions ({len(hold)}): {', '.join(hold) or '—'}\n"
+                f"Watchlist ({len(watch)}): {', '.join(watch) or '—'}")
+
     return _HELP
 
 

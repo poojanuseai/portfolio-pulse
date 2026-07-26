@@ -3,6 +3,13 @@
 -- All tables are written only by the poller (service-role key). The dashboard
 -- reads with the same key (or a read-only key). No public/anon access.
 
+-- Drop tables from the original broker/DMA-oriented build, if this is being
+-- re-run against a project that already had them — this fork has no broker
+-- connection and no DMA signal, so these are dead weight.
+drop table if exists dma_state;
+drop table if exists auth_token;
+drop table if exists seen_items;
+
 create table if not exists watchlist (
     symbol      text primary key,
     name        text not null default '',
@@ -18,20 +25,10 @@ create table if not exists holdings_snapshot (
     synced_at   timestamptz not null default now()
 );
 
-create table if not exists seen_items (
-    guid         text primary key,                -- dedup key
-    symbol       text,
-    source_type  text,
-    title        text,
-    url          text,
-    published_at timestamptz,
-    ingested_at  timestamptz not null default now()
-);
-
 create table if not exists alerts (
     id          bigserial primary key,
     symbol      text not null,
-    alert_type  text not null,                    -- filing|news|dma_forming|dma_confirmed|golden_cross
+    alert_type  text not null,                    -- taxonomy TBD, see signals/criteria.py
     title       text not null default '',
     summary     text not null default '',
     impact      text not null default '',
@@ -40,23 +37,6 @@ create table if not exists alerts (
     qc_status   text not null default '',
     created_at  timestamptz not null default now(),
     delivered   boolean not null default false
-);
-
-create table if not exists dma_state (
-    symbol         text primary key,
-    sma50          double precision,
-    sma200         double precision,
-    relation       text,
-    gap_pct        double precision,
-    projected_days double precision,
-    updated_at     timestamptz not null default now()
-);
-
-create table if not exists auth_token (
-    id           integer primary key check (id = 1),
-    access_token text not null,
-    public_token text not null default '',
-    issued_at    timestamptz not null default now()
 );
 
 create table if not exists meta (

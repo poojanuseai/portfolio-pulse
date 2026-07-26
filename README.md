@@ -1,126 +1,112 @@
 # Portfolio Pulse
 
-A 24/7 personal monitor for your **Zerodha (NSE)** portfolio. For every stock you
-hold or watch, it tracks **NSE corporate filings** and **verified news**, detects
-**50/200-DMA death & golden crosses**, and pushes source-cited alerts to
-**Telegram**. A **Streamlit dashboard** is the companion view.
+A 24/7 personal tracker for a **manually-logged US equities portfolio**. No
+broker connection — you log your own positions (ticker, quantity, average
+cost) via Telegram or the dashboard. It refreshes live prices, shows P&L on a
+**Streamlit dashboard**, and pushes alerts to **Telegram** whenever custom
+screener-driven criteria (not built yet — see below) fire.
 
-> **Not investment advice.** This is a personal software tool that computes
-> public facts (exchange filings, moving averages) about stocks YOU choose. It
-> makes no recommendations and never executes trades. Impact labels, when
-> enabled, are a mechanical reading of filing/news text.
+> **Not investment advice.** This is a personal software tool for tracking
+> positions you choose and computing plain P&L/price facts about them. It
+> makes no recommendations and never executes trades.
+
+## What's here vs. what's next
+
+This build deliberately does **not** include a broker connection, filings/news
+monitoring, or a moving-average-crossover signal — those were specific to the
+original NSE/Zerodha version this was forked from. What's here now:
+
+- **Manual position logging** — `/add SYMBOL QTY PRICE` in Telegram, or the
+  dashboard's Watchlist tab. No broker OAuth, no API keys beyond Telegram/Supabase.
+- **Live price refresh** — every ~10 minutes during US market hours, via yfinance.
+- **A dashboard** (Portfolio P&L, Stock History, Alert Feed, Watchlist) reading
+  the same database the Telegram bot writes to.
+- **An empty, obvious extension point** (`portfolio_pulse/signals/criteria.py`)
+  for whatever custom alert rules get defined later — e.g. wired to a separate
+  screener's composite score, RRG quadrant, or trend-filter signal. Until that's
+  designed, the Alert Feed stays empty; nothing false-positives in the meantime.
 
 ## Run your own copy — free
 
-Everything runs on free tiers; the total infrastructure cost is ₹0/month. Your
-portfolio data stays entirely in YOUR accounts — nothing is shared with anyone,
-including the tool's author.
+Everything runs on free tiers; the total infrastructure cost is $0/month. Your
+portfolio data stays entirely in YOUR Supabase project — nothing is shared
+with anyone, including the tool's author.
 
 1. **Fork this repo** (public fork keeps GitHub Actions free & unlimited), then
    in your fork open the **Actions** tab and click **"Enable workflows"**.
-2. Follow **[SETUP_GUIDE.md](SETUP_GUIDE.md)** top to bottom (~40 min): Telegram
-   bot → Supabase database → your broker via Kite MCP (no API fees) →
-   GitHub secrets → optional cron-job.org pinger for on-the-dot timing.
+2. Follow **[SETUP_GUIDE.md](SETUP_GUIDE.md)** top to bottom: Telegram bot →
+   Supabase database → GitHub secrets → (optional) Streamlit Cloud dashboard.
    Wherever an instruction shows a repo URL/path, substitute your own username.
-3. Optional extras: an Anthropic API key (~$5 lasts months) upgrades alerts
-   from headline-only to guarded AI summaries; `Start Dashboard (Mac).command`
-   opens the local dashboard.
+   Exactly **4 secrets** are needed: `SUPABASE_URL`, `SUPABASE_KEY`,
+   `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`.
+3. In Telegram, send `/add AAPL 10 185.50` (ticker, quantity, average cost) for
+   each position, or `/watch MSFT` to track a stock with no position.
 
 Licensed under the [MIT License](LICENSE) — free to use, modify, and share.
 
-## Free by default — and smart without any AI key
-The stock summariser needs no paid services: it **downloads the actual filing
-document**, quotes the most information-dense sentences verbatim, extracts the
-key figures (₹ amounts, percentages, dates) mechanically, composes exact
-template summaries for corporate actions (dividends, bonuses, splits), and
-classifies impact with transparent keyword rules. Routine paperwork filings
-and company-quoted-as-analyst news are filtered out. Adding an
-`ANTHROPIC_API_KEY` secret is optional — it upgrades phrasing and judgment,
-never facts.
-
-## The one rule: no fabricated facts
-Every alert is traceable to a primary source. The summariser only *compresses*
-text that was actually fetched — guardrails enforce this:
-1. **Verbatim-first** — keyless summaries are quoted sentences; quoting can't
-   hallucinate by construction.
-2. **Thin-source gate** — too little text ⇒ headline + link only.
-3. **Numeric grounding** — an AI summary containing any number absent from the
-   source is discarded in favour of the verbatim headline.
-4. **Source whitelist** — news only from trusted publishers; NSE filings come
-   straight from the exchange's official RSS feeds (no scraping).
-
 ## Architecture
 ```
-GitHub Actions (cron)                         Streamlit Cloud
- ├ morning_auth  08:15 IST  ─┐                 └ dashboard/app.py
- ├ fast_poll     */10 IST   ─┤  read/write        (reads + watchlist edits,
- └ dma_scan      18:45 IST  ─┘      ▼               Kite token callback)
-                          Supabase (Postgres)  ◄──────────┘
-        ▲ NSE RSS filings   ▲ Pulse/publisher news   ▲ yfinance + Kite quote
+GitHub Actions (cron, ~10 min during US market hours)     Streamlit Cloud
+ └ heartbeat → fast_poll: refresh prices, drain Telegram,  └ dashboard/app.py
+   run signals/criteria.scan() (empty until defined)          (reads + logs
+                        │                                       positions)
+                        ▼
+                 Supabase (Postgres)  ◄─────────────────────────────┘
+                        ▲
+                   yfinance (US ticker daily/latest close)
 ```
-- **Brokers (connect one or several)** — all via each broker's OFFICIAL MCP server:
-  - **Zerodha** — `/connect` in Telegram → tap the Login-with-Kite link
-  - **Upstox** — one-time `python -m portfolio_pulse.jobs.upstox_connect`
-    (OAuth; the cloud auto-renews via refresh tokens)
-  - **Dhan / Groww** — one-time
-    `python -m portfolio_pulse.jobs.broker_connect dhan` (or `groww`) —
-    endpoints discovered live from each broker's own OAuth metadata
-  - **Fyers** — `python -m portfolio_pulse.jobs.broker_connect fyers`
-    (login-link flow, like Zerodha)
-  - Any other broker (e.g. Angel One, ICICI): add your stocks with `/add` —
-    every feature except auto-holdings-import works identically
-  - All connections are read-only; order tools are never called. Holdings are
-    tracked per broker.
-- **Filings**: NSE official RSS (`nsearchives.nseindia.com/content/RSS/*.xml`).
-- **News**: Pulse by Zerodha + whitelisted publisher RSS.
-- **Prices**: yfinance `.NS` (primary) cross-checked against the Kite quote; a >1%
-  disagreement marks the signal `SUSPECT` and the alert is held.
-- **Summaries**: Claude Haiku 4.5, extractive + guarded.
-- **Store**: SQLite locally, Supabase in production (shared by poller + dashboard).
+- **Positions**: logged by hand via Telegram (`/add /sell /watch /remove`) or
+  the dashboard's Watchlist tab — no broker API, no OAuth.
+- **Prices**: yfinance, refreshed on every poll for whatever's in your
+  positions/watchlist.
+- **Alerts**: none yet — `signals/criteria.py` is an intentionally empty hook;
+  the Alert Feed and Stock History tabs will populate once criteria are wired in.
+- **Store**: SQLite locally, Supabase in production (shared by the GitHub
+  Actions poller and the Streamlit Cloud dashboard, which run on different hosts).
 
 ## Module map
 | Path | Responsibility |
 |---|---|
-| `config.py` | Feed URLs, thresholds, IST calendar, env plumbing |
+| `config.py` | Thresholds, US/ET market calendar, env plumbing |
 | `store/db.py` · `store/supabase_store.py` | Repository API (SQLite / Supabase) |
-| `broker/kite_mcp.py` · `broker/kite_auth.py` · `broker/holdings.py` | MCP client (default), optional API auth, holdings + symbol→name map |
-| `ingest/nse_rss.py` · `ingest/news_rss.py` · `ingest/matching.py` | Feeds + dedup + matching |
-| `signals/prices.py` · `signals/dma.py` | Price cross-check + cross detection |
-| `summarize/guardrail.py` | Guarded extractive summariser |
-| `notify/telegram.py` | Push + `/add /remove /list /holdings` |
-| `jobs/*` | `fast_poll`, `dma_scan`, `morning_auth`, `mcp_sync` |
-| `dashboard/app.py` | Streamlit dashboard + Kite token callback |
+| `notify/telegram.py` | Push + `/add /sell /watch /remove /positions /list` |
+| `signals/criteria.py` | Empty extension point for future custom alert rules |
+| `jobs/fast_poll.py` · `jobs/heartbeat.py` | Price refresh + command drain, run every tick |
+| `jobs/setup_check.py` | The "did I do it right?" verification job |
+| `jobs/migrate_to_supabase.py` | One-time local-SQLite → Supabase copy |
+| `dashboard/app.py` | Streamlit dashboard |
 
 ## Quick start (local, offline-friendly)
 ```bash
-cd "Portfolio Pulse"
-python3 -m venv .venv && source .venv/bin/activate
+cd portfolio-pulse
+python3 -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 cp .env.example .env          # fill in what you have; SQLite needs nothing
 
 # run the dashboard (SQLite backend by default)
 streamlit run portfolio_pulse/dashboard/app.py
 
-# run a poll once
+# run a poll once (price refresh + drain any pending Telegram commands)
 python -m portfolio_pulse.jobs.fast_poll
 ```
-Filings, news, and DMA detection run without any credentials (matching is weaker
-without the Kite instruments name-map). Telegram/holdings/summaries activate as
-you add each secret. See [SETUP_GUIDE.md](SETUP_GUIDE.md) for the full path.
+Price refresh and the dashboard run without any credentials at all (SQLite,
+no Telegram). Telegram commands activate once `TELEGRAM_BOT_TOKEN` /
+`TELEGRAM_CHAT_ID` are set. See [SETUP_GUIDE.md](SETUP_GUIDE.md) for the full path.
 
 ## Hosting & cost
 - **Poller**: GitHub Actions cron (free). Use a **public** repo for unlimited
-  Actions minutes (secrets live in GitHub Secrets, never in code); a private repo
-  can exceed the 2,000 free min/month at `*/10` — widen to `*/15` or go public.
-  Cron can lag a few minutes and won't fire second-precise — fine for filings/EOD,
-  not intraday ticks (out of scope). Fly.io free machine is the fallback if you
-  later want tighter latency.
+  Actions minutes (secrets live in GitHub Secrets, never in code); a private
+  repo can exceed the 2,000 free min/month at `*/10` — widen to `*/15` or go
+  public. Cron can lag a few minutes and won't fire second-precise — fine for
+  a position tracker, not intraday ticks (out of scope).
 - **Store**: Supabase free tier. **Dashboard**: Streamlit Community Cloud (free).
-- **APIs**: Kite personal plan free; NSE RSS + Pulse free; only Anthropic Haiku
-  usage costs (a few dollars/month at personal volume).
+- **APIs**: yfinance and the Telegram Bot API are both free.
 
-## Known limits (v1)
-- Daily Kite re-auth needs one manual tap (fully-automated TOTP login may violate
-  Zerodha's terms — deliberately not built in).
-- yfinance `.NS` can misprint; the Kite cross-check + `SUSPECT` hold mitigate it.
-- NSE RSS content is used for personal, non-commercial monitoring only.
+## Known limits
+- No broker sync — every position is entered by hand, and stays exactly as
+  entered until you `/add` it again or `/sell`/`/remove` it.
+- No alert criteria are defined yet (`signals/criteria.py` returns `[]`) — the
+  Telegram bot and dashboard are fully functional for tracking, but nothing
+  pushes a proactive alert until that's built.
+- yfinance data can occasionally misprint or lag; there's no second-source
+  cross-check (the original NSE/Kite version had one, specific to that broker).

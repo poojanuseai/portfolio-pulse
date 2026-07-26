@@ -13,8 +13,7 @@ fi
 # shellcheck disable=SC1091
 set -a; source .env; set +a
 
-for key in SUPABASE_URL SUPABASE_KEY TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID \
-           ANTHROPIC_API_KEY KITE_API_KEY KITE_API_SECRET; do
+for key in SUPABASE_URL SUPABASE_KEY TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID; do
   val="${!key:-}"
   if [ -n "$val" ]; then
     printf '%s' "$val" | gh secret set "$key"

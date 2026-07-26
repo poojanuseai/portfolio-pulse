@@ -44,45 +44,16 @@ def run() -> dict:
                         "send failed: token or chat id wrong, or you haven't "
                         "pressed START on your bot"))
 
-    # 3. NSE feed reachability (no credentials involved). The feed is often
-    # EMPTY outside filing hours (NSE rotates it overnight) — that's normal,
-    # so we test reachability, not content.
-    try:
-        import requests
-
-        resp = requests.get(config.NSE_RSS_FEEDS["announcements"],
-                            headers=config.HTTP_HEADERS, timeout=config.HTTP_TIMEOUT)
-        reachable = resp.ok and b"<rss" in resp.content[:200]
-        n = resp.content.count(b"<item>")
-        results.append(("NSE filings feed", reachable,
-                        f"reachable; {n} announcements right now "
-                        "(0 is normal outside market/filing hours)"
-                        if reachable else f"HTTP {resp.status_code}"))
-    except Exception as exc:
-        results.append(("NSE filings feed", False, str(exc)[:80]))
-
-    # 4. Broker + tracked stocks (informational — not required to pass)
-    broker_note = "not connected yet — send /connect to your bot (Zerodha) "\
-                  "or add stocks with /add SYMBOL"
-    tracked = 0
+    # 3. Tracked positions (informational — not required to pass)
     if store is not None:
-        try:
-            from portfolio_pulse.broker import get_live_brokers
-
-            live = [name for name, _ in get_live_brokers(store)]
-            tracked = len(store.all_symbols())
-            if live:
-                broker_note = f"connected: {', '.join(live)}"
-        except Exception:
-            pass
-        results.append(("Broker connection", True, broker_note))
+        tracked = len(store.all_symbols())
         results.append(("Tracked stocks", True,
                         f"{tracked} being monitored" if tracked else
-                        "none yet — /add or /connect from Telegram"))
+                        "none yet — /add SYMBOL QTY PRICE or /watch SYMBOL from Telegram"))
 
     # Report
     core_ok = all(ok for name, ok, _ in results
-                  if name in ("Database (Supabase)", "Telegram bot", "NSE filings feed"))
+                  if name in ("Database (Supabase)", "Telegram bot"))
     print("\n===== PORTFOLIO PULSE SETUP CHECK =====")
     for name, ok, note in results:
         print(f"  {'✅' if ok else '❌'} {name}: {note}")
@@ -93,10 +64,10 @@ def run() -> dict:
         send_message(
             "🎉 <b>Setup complete — Portfolio Pulse is live!</b>\n"
             "From now on it runs by itself. Next steps:\n"
-            "• /connect — link your Zerodha (holdings auto-sync)\n"
-            "• /add SYMBOL — track any stock on any broker\n"
+            "• /add SYMBOL QTY PRICE — log a position\n"
+            "• /watch SYMBOL — track a stock with no position\n"
             "• /help — everything else\n"
-            "Alerts arrive here automatically. Not investment advice."
+            "Not investment advice."
         )
         print("ALL CORE CHECKS PASSED — success message sent to your Telegram.")
     else:

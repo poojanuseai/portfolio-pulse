@@ -1,17 +1,19 @@
 name: fast-poll
 
-# Filings + news + Telegram command drain.
-# ~08:00–24:00 IST is 02:30–18:30 UTC. '*/10 2-18' covers it with a small margin.
-# NOTE (free-tier minutes): every 10 min for ~17h ≈ 100 runs/day. On a PRIVATE
-# repo that can exceed the 2,000 free minutes/month — use a PUBLIC repo (Actions
-# minutes are unlimited there; all secrets stay in GitHub Secrets, never in code),
-# or widen the interval to '*/15'. See README "Hosting".
+# Position-price refresh + Telegram command drain (backup cadence; pulse-loop
+# above is the primary ~10-min driver — this cron catches any gap in it).
+# ~05:00-24:00 ET is roughly 09:00-04:00(+1) UTC; '9-23' covers the bulk of
+# it with a simple single-day cron. NOTE (free-tier minutes): every 10 min for
+# ~15h ≈ 90 runs/day. On a PRIVATE repo that can exceed the 2,000 free
+# minutes/month — use a PUBLIC repo (Actions minutes are unlimited there; all
+# secrets stay in GitHub Secrets, never in code), or widen the interval to
+# '*/15'. See README "Hosting".
 on:
   schedule:
     # Off-peak minute offsets — GitHub throttles/drops crons on the congested
     # :00/:10/:20... slots hardest; odd offsets measurably improve delivery.
     # GH cron remains best-effort: expect ~10-20 min typical, worse at peak.
-    - cron: "4,14,24,34,44,54 2-18 * * *"
+    - cron: "4,14,24,34,44,54 9-23 * * *"
   workflow_dispatch:
 
 concurrency:
@@ -29,15 +31,11 @@ jobs:
           python-version: "3.11"
           cache: pip
       - run: pip install -r requirements.txt
-      - name: Run heartbeat (poll + due daily jobs)
+      - name: Run heartbeat (price refresh + commands + due jobs)
         env:
           PP_STORE_BACKEND: supabase
-          PP_DASHBOARD_URL: ${{ vars.PP_DASHBOARD_URL }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          KITE_API_KEY: ${{ secrets.KITE_API_KEY }}
-          KITE_API_SECRET: ${{ secrets.KITE_API_SECRET }}
         run: python -m portfolio_pulse.jobs.heartbeat
