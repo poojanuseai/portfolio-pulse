@@ -12,7 +12,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from portfolio_pulse import config
-from portfolio_pulse.store.db import Alert, WatchItem, _iso
+from portfolio_pulse.store.db import Alert, Forecast, WatchItem, _iso
 
 
 class SupabaseStore:
@@ -108,6 +108,28 @@ class SupabaseStore:
             Alert(r["id"], r["symbol"], r["alert_type"], r["title"], r["summary"],
                   r["impact"], r["source_url"], r["source_type"], r["qc_status"],
                   r["created_at"], bool(r["delivered"]))
+            for r in rows
+        ]
+
+    # -- forecasts --------------------------------------------------------------
+    def record_forecast(self, symbol: str, execution_date: str, target_date: str,
+                        last_close: float, predicted_close: float,
+                        return_pct: float, confidence: float) -> None:
+        self._t("forecasts").upsert({
+            "symbol": symbol.strip().upper(), "execution_date": execution_date,
+            "target_date": target_date, "last_close": float(last_close),
+            "predicted_close": float(predicted_close), "return_pct": float(return_pct),
+            "confidence": float(confidence), "created_at": _iso(),
+        }, on_conflict="symbol,execution_date").execute()
+
+    def list_forecasts(self, limit: int = 200) -> list[Forecast]:
+        rows = (self._t("forecasts").select("*")
+                .order("execution_date", desc=True).order("return_pct", desc=True)
+                .limit(limit).execute().data or [])
+        return [
+            Forecast(r["id"], r["symbol"], r["execution_date"], r["target_date"],
+                     r["last_close"], r["predicted_close"], r["return_pct"],
+                     r["confidence"], r["created_at"])
             for r in rows
         ]
 

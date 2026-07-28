@@ -13,6 +13,7 @@ os.environ.setdefault("PP_SQLITE_PATH", "/tmp/pp_test_regress.db")
 
 import pytest
 
+from portfolio_pulse.jobs import import_forecasts
 from portfolio_pulse.notify import telegram
 from portfolio_pulse.store.db import SQLiteStore
 
@@ -160,6 +161,52 @@ class TestParseCommand:
 
     def test_non_command_returns_empty(self):
         assert telegram.parse_command("just chatting") == ("", "")
+
+
+class TestForecasts:
+    def test_record_then_list(self, store):
+        store.record_forecast("AAPL", "2026-07-28", "2026-08-11", 185.50, 197.20, 6.31, 0.812)
+        rows = store.list_forecasts()
+        assert len(rows) == 1
+        assert rows[0].symbol == "AAPL"
+        assert rows[0].return_pct == 6.31
+
+    def test_reimport_same_batch_upserts_not_duplicates(self, store):
+        store.record_forecast("AAPL", "2026-07-28", "2026-08-11", 185.50, 197.20, 6.31, 0.812)
+        store.record_forecast("AAPL", "2026-07-28", "2026-08-11", 185.50, 199.00, 7.25, 0.900)
+        rows = store.list_forecasts()
+        assert len(rows) == 1
+        assert rows[0].return_pct == 7.25  # latest import wins
+
+    def test_ranked_within_batch_by_return_pct(self, store):
+        store.record_forecast("MSFT", "2026-07-28", "2026-08-11", 400, 410, 2.5, 0.7)
+        store.record_forecast("NVDA", "2026-07-28", "2026-08-11", 100, 112, 12.0, 0.8)
+        rows = store.list_forecasts()
+        assert [r.symbol for r in rows] == ["NVDA", "MSFT"]
+
+
+class TestImportForecastsJob:
+    def test_run_parses_csv_and_writes_forecasts(self, store, tmp_path, monkeypatch):
+        monkeypatch.setattr(import_forecasts, "get_store", lambda: store)
+        csv_path = tmp_path / "kronos_check_2026-07-28.csv"
+        csv_path.write_text(
+            "Execution Date,Target Date,Symbol,Last Close,Predicted Close (2W),"
+            "Predicted Return %,Confidence (0-1)\n"
+            "2026-07-28,2026-08-11,NVDA,100.00,112.00,12.00,0.800\n"
+            "2026-07-28,2026-08-11,MSFT,400.00,410.00,2.50,0.700\n"
+        )
+        count = import_forecasts.run(str(csv_path))
+        assert count == 2
+        rows = store.list_forecasts()
+        assert [r.symbol for r in rows] == ["NVDA", "MSFT"]
+        assert rows[0].predicted_close == 112.00
+
+    def test_run_rejects_wrong_shaped_csv(self, store, tmp_path, monkeypatch):
+        monkeypatch.setattr(import_forecasts, "get_store", lambda: store)
+        csv_path = tmp_path / "not_kronos.csv"
+        csv_path.write_text("Symbol,Price\nAAPL,185.50\n")
+        with pytest.raises(ValueError, match="missing column"):
+            import_forecasts.run(str(csv_path))
 
 
 class TestResolveStockFormatGuard:

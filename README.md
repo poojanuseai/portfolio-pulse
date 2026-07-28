@@ -74,7 +74,27 @@ GitHub Actions (cron, ~10 min during US market hours)     Streamlit Cloud
 | `jobs/fast_poll.py` · `jobs/heartbeat.py` | Price refresh + command drain, run every tick |
 | `jobs/setup_check.py` | The "did I do it right?" verification job |
 | `jobs/migrate_to_supabase.py` | One-time local-SQLite → Supabase copy |
+| `jobs/import_forecasts.py` | Local-only: imports a kronos-check TP-estimate CSV into the `forecasts` table |
 | `dashboard/app.py` | Streamlit dashboard |
+
+## Optional: TP estimates from kronos-check
+
+If you separately run **US-Market-Move-Screener** to scan sectors/stocks and
+**kronos-check** (built on the [Kronos](https://github.com/shiyu-coder/Kronos)
+forecasting model) to estimate a shortlist's target price, their output can
+feed straight into this dashboard's **TP Estimates** tab:
+
+1. Scan manually in the Screener, note down a shortlist of symbols.
+2. Run kronos-check on that shortlist — it writes `output/kronos_check_<date>.csv`.
+3. `python -m portfolio_pulse.jobs.import_forecasts path\to\kronos_check_<date>.csv`
+   — upserts the rows into a `forecasts` table and pings your Telegram bot with
+   the top result. Run this locally with a `.env` pointing at the same
+   Supabase project as the poller (`PP_STORE_BACKEND=supabase`,
+   `SUPABASE_URL`, `SUPABASE_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`).
+
+Deliberately not automated in GitHub Actions — kronos-check needs `torch` and
+a local price-history cache, neither of which belong on a free cloud runner.
+This is a manual, run-it-yourself step, same as the scan that feeds it.
 
 ## Quick start (local, offline-friendly)
 ```bash

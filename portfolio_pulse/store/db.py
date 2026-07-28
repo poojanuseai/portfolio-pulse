@@ -39,6 +39,19 @@ class WatchItem:
 
 
 @dataclass
+class Forecast:
+    id: Optional[int]
+    symbol: str
+    execution_date: str  # the day the forecast batch was run (kronos-check's "Execution Date")
+    target_date: str     # the day being predicted for
+    last_close: float
+    predicted_close: float
+    return_pct: float
+    confidence: float
+    created_at: str
+
+
+@dataclass
 class Alert:
     id: Optional[int]
     symbol: str
@@ -77,6 +90,12 @@ class Store(Protocol):
     def record_alert(self, alert: Alert) -> int: ...
     def mark_delivered(self, alert_id: int) -> None: ...
     def list_alerts(self, limit: int = 50, symbol: Optional[str] = None) -> list[Alert]: ...
+
+    # forecasts (kronos-check TP estimates, imported by jobs/import_forecasts.py)
+    def record_forecast(self, symbol: str, execution_date: str, target_date: str,
+                        last_close: float, predicted_close: float,
+                        return_pct: float, confidence: float) -> None: ...
+    def list_forecasts(self, limit: int = 200) -> list[Forecast]: ...
 
     # generic key-value (e.g. Telegram update offset)
     def get_meta(self, key: str) -> Optional[str]: ...
@@ -117,8 +136,21 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT
 );
+CREATE TABLE IF NOT EXISTS forecasts (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol           TEXT NOT NULL,
+    execution_date   TEXT NOT NULL,
+    target_date      TEXT NOT NULL,
+    last_close       REAL NOT NULL,
+    predicted_close  REAL NOT NULL,
+    return_pct       REAL NOT NULL,
+    confidence       REAL NOT NULL,
+    created_at       TEXT NOT NULL,
+    UNIQUE(symbol, execution_date)
+);
 CREATE INDEX IF NOT EXISTS idx_alerts_symbol ON alerts(symbol);
 CREATE INDEX IF NOT EXISTS idx_alerts_created ON alerts(created_at);
+CREATE INDEX IF NOT EXISTS idx_forecasts_execdate ON forecasts(execution_date);
 """
 
 
@@ -309,6 +341,46 @@ class SQLiteStore:
                 Alert(r["id"], r["symbol"], r["alert_type"], r["title"], r["summary"],
                       r["impact"], r["source_url"], r["source_type"], r["qc_status"],
                       r["created_at"], bool(r["delivered"]))
+                for r in rows
+            ]
+        finally:
+            conn.close()
+
+    # -- forecasts --------------------------------------------------------------
+    def record_forecast(self, symbol: str, execution_date: str, target_date: str,
+                        last_close: float, predicted_close: float,
+                        return_pct: float, confidence: float) -> None:
+        """Upsert on (symbol, execution_date) so re-importing the same day's
+        kronos-check CSV doesn't create duplicate rows."""
+        conn = self._connect()
+        try:
+            conn.execute(
+                """INSERT INTO forecasts(symbol, execution_date, target_date, last_close,
+                                         predicted_close, return_pct, confidence, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(symbol, execution_date) DO UPDATE SET
+                       target_date=excluded.target_date, last_close=excluded.last_close,
+                       predicted_close=excluded.predicted_close, return_pct=excluded.return_pct,
+                       confidence=excluded.confidence, created_at=excluded.created_at""",
+                (symbol.strip().upper(), execution_date, target_date, last_close,
+                 predicted_close, return_pct, confidence, _iso()),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def list_forecasts(self, limit: int = 200) -> list[Forecast]:
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """SELECT * FROM forecasts ORDER BY execution_date DESC, return_pct DESC
+                   LIMIT ?""",
+                (limit,),
+            ).fetchall()
+            return [
+                Forecast(r["id"], r["symbol"], r["execution_date"], r["target_date"],
+                         r["last_close"], r["predicted_close"], r["return_pct"],
+                         r["confidence"], r["created_at"])
                 for r in rows
             ]
         finally:

@@ -299,6 +299,33 @@ def _watchlist_tab(store) -> None:
         st.caption("Nothing tracked yet.")
 
 
+def _forecasts_tab(store) -> None:
+    st.subheader("Kronos TP Estimates")
+    st.caption("Imported from kronos-check (run locally against a shortlist you "
+               "pick after scanning US-Market-Move-Screener). Not investment advice.")
+    forecasts = store.list_forecasts(limit=500)
+    if not forecasts:
+        st.info("No forecasts imported yet — run kronos-check on your shortlist, "
+                "then `python -m portfolio_pulse.jobs.import_forecasts <csv>`.")
+        return
+    dates = sorted({f.execution_date for f in forecasts}, reverse=True)
+    exec_date = st.selectbox("Batch (execution date)", dates)
+    batch = sorted((f for f in forecasts if f.execution_date == exec_date),
+                   key=lambda f: f.return_pct, reverse=True)
+    rows = [{
+        "Symbol": f.symbol, "Last $": round(f.last_close, 2),
+        "Predicted $": round(f.predicted_close, 2), "Return %": round(f.return_pct, 2),
+        "Confidence": round(f.confidence, 3), "Target date": f.target_date,
+    } for f in batch]
+    st.dataframe(
+        rows, use_container_width=True, hide_index=True,
+        column_config={
+            "Return %": st.column_config.NumberColumn(format="%.2f%%"),
+            "Confidence": st.column_config.ProgressColumn(min_value=0.0, max_value=1.0),
+        },
+    )
+
+
 def main() -> None:
     # Optional password gate: set DASHBOARD_PASSWORD in the app's secrets to
     # keep a cloud-hosted dashboard private. Unset = open (fine for local use).
@@ -344,8 +371,9 @@ def main() -> None:
     _status_bar(store)
     st.divider()
 
-    portfolio, history, feed, watch = st.tabs(
-        ["💼 Portfolio", "🕘 Stock History", "📨 Alert Feed", "👁 Watchlist"]
+    portfolio, history, feed, watch, forecasts = st.tabs(
+        ["💼 Portfolio", "🕘 Stock History", "📨 Alert Feed", "👁 Watchlist",
+         "🎯 TP Estimates"]
     )
     with portfolio:
         _portfolio_tab(store)
@@ -355,6 +383,8 @@ def main() -> None:
         _feed_tab(store)
     with watch:
         _watchlist_tab(store)
+    with forecasts:
+        _forecasts_tab(store)
 
 
 main()
